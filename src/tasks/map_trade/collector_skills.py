@@ -344,7 +344,20 @@ class SkillExecutionMixin:
     def _check_collection_skill_layout(self) -> None:
         if self._skill_layout_checked:
             return
-        expected = (SEARCH_ICON, ABSORB_ICON, SUMMON_ICON, SUBDUE_ICON)
+        # Only validate slots used by the current action policy. An account
+        # without the summon character leaves slot 3 empty or filled with an
+        # unrelated skill; that must not be reported as a misplaced icon.
+        enabled = getattr(self, "_scope_actions", None) or (
+            SUMMON_ACTION.name, SUPPRESS_ACTION.name, ABSORB_ACTION.name,
+        )
+        expected = (SEARCH_ICON, ABSORB_ICON) + tuple(
+            icon
+            for name, icon in (
+                (SUMMON_ACTION.name, SUMMON_ICON),
+                (SUPPRESS_ACTION.name, SUBDUE_ICON),
+            )
+            if name in enabled
+        )
         previous = ()
         for sample in range(2):
             frame, recovered = self._capture_skill_field()

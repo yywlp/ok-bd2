@@ -196,6 +196,7 @@ class PVPTask(BaseBD2Task):
                 "PVP 定位修正阈值": 0.76,
                 "loading 出现等待秒数": 6.0,
                 "loading 消失等待秒数": 35.0,
+                "允许使用非免费鸡尾酒": False,
             }
         )
         self.config_description.update(
@@ -218,6 +219,11 @@ class PVPTask(BaseBD2Task):
                     "战斗玩法游戏卡带标签确认为高亮状态所需的最低亮色像素占比。"
                 ),
                 "PVP 箱庭感叹号阈值": "进入 PVP 箱庭后识别 tanhaoGE.png 的模板匹配阈值。",
+                "允许使用非免费鸡尾酒": (
+                    "默认关闭：只使用免费鸡尾酒，免费次数不可用时跳过镜中之战并继续后续任务。"
+                    "开启后允许消耗背包内的非免费鸡尾酒继续自动战斗（不再强制勾选"
+                    "「仅用免费鸡尾酒」），请注意会消耗库存资源。"
+                ),
             }
         )
 
@@ -250,6 +256,9 @@ class PVPTask(BaseBD2Task):
             start_state = self._start_auto_battle(current_multiplier)
         if start_state == "settlement":
             return self._return_home_after_settlement()
+        if start_state == "free_ap_unavailable":
+            # 免费鸡尾酒不可用时按「跳过」处理，避免整个一键日常在此中止。
+            return True
         if start_state == "ap_depleted":
             self.info_set("状态", "免费 AP 已耗尽。")
             self.log_completion("镜中之战：免费 AP 已耗尽，流程结束。")
@@ -432,6 +441,7 @@ class PVPTask(BaseBD2Task):
                 brightness_threshold=self._home_p95_threshold(),
                 gacha_ocr_text=gacha_text,
                 context="镜中之战确认主页",
+                frame=frame,
             )
             self.sleep(interval)
 
@@ -669,8 +679,13 @@ class PVPTask(BaseBD2Task):
             self._save_flow_diagnostic("pvp_auto_battle_failed")
             return "failed"
 
-        if not self._ensure_free_ap_enabled():
-            return "failed"
+        if self._allow_paid_cocktail():
+            # 允许消耗背包内的非免费鸡尾酒：不再强制勾住「仅用免费鸡尾酒」。
+            self._ensure_free_ap_disabled()
+        elif not self._ensure_free_ap_enabled():
+            # 免费开关打不开通常意味着免费次数已耗尽/开关被禁用；此时按跳过
+            # 处理并主动退出弹窗回主页，一键日常才能继续执行后面的子任务。
+            return self._skip_unavailable_free_cocktail()
         if not self._ensure_multiplier(multiplier):
             return "failed"
         self._select_max_battle_count()
@@ -711,6 +726,54 @@ class PVPTask(BaseBD2Task):
             "按结算等待继续。"
         )
         return "started"
+
+    def _allow_paid_cocktail(self) -> bool:
+        return bool(self.config.get("允许使用非免费鸡尾酒", False))
+
+    def _ensure_free_ap_disabled(self) -> bool:
+        """允许使用非免费鸡尾酒时，确认「仅用免费」开关没有勾住。
+
+        关不掉也不中止：开关可能被游戏禁用，继续按当前状态尝试战斗，
+        AP 不足由 ``_wait_battle_start_or_ap_shortage`` 正常收尾。
+        """
+        self.info_set("当前阶段", "确认允许使用非免费鸡尾酒")
+        for _attempt in range(1, PVP_CLICK_VERIFY_ATTEMPTS + 1):
+            if not self._free_ap_switch_on():
+                self.info_set("PVP 免费AP", "未开启（允许非免费）")
+                return True
+            self._click_screen_reference(
+                *PVP_FREE_AP_SWITCH_SCREEN_POINT,
+                after_sleep=1.0,
+            )
+        if not self._free_ap_switch_on():
+            self.info_set("PVP 免费AP", "未开启（允许非免费）")
+            return True
+        self.info_set("PVP 免费AP", "仍开启")
+        self.log_info("镜中之战：仅用免费鸡尾酒开关未能关闭，按当前状态继续战斗。")
+        return False
+
+    def _skip_unavailable_free_cocktail(self) -> str:
+        """免费鸡尾酒不可用：退出自动战斗弹窗、尝试回主页，本次按跳过收尾。"""
+        message = "镜中之战：未检测到可用的免费鸡尾酒，跳过本次自动战斗。"
+        self.info_set("状态", "免费鸡尾酒不可用，已跳过。")
+        self.info_set("当前阶段", "跳过并尝试返回主页")
+        self.log_info(message)
+        try:
+            self.back(after_sleep=1.0)
+        except (TaskDisabledException, FinishedException):
+            raise
+        except Exception as exc:
+            self.log_warning(f"镜中之战：关闭自动战斗弹窗失败：{exc}")
+        self._auto_return_home_cooldown_until = 0.0
+        try:
+            if not self.auto_return_main_home(notify_failure=False):
+                self.try_return_home_with_back()
+        except (TaskDisabledException, FinishedException):
+            raise
+        except Exception as exc:
+            self.log_warning(f"镜中之战：跳过后返回主页异常：{exc}")
+        self.log_completion(message + "已尝试返回主页。")
+        return "free_ap_unavailable"
 
     def _ensure_free_ap_enabled(self) -> bool:
         self.info_set("当前阶段", "确认仅用免费鸡尾酒")
@@ -1219,6 +1282,7 @@ class PVPTask(BaseBD2Task):
                 brightness_threshold=self._home_p95_threshold(),
                 gacha_ocr_text=gacha_text,
                 context="PVP 返回主页",
+                frame=frame,
             )
             self.sleep(interval)
         return False

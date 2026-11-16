@@ -20,6 +20,7 @@ from src.tasks.map_trade.collection_selection import (
 )
 from src.tasks.map_trade.collector import Collector
 from src.tasks.map_trade.collector_constants import (
+    ABSORB_ACTION,
     BATTLE_ACTIONS,
     SUPPRESS_ACTION,
     SkillExecutionResult,
@@ -130,6 +131,7 @@ class MapCollectionTaskScopeTest(unittest.TestCase):
                 task.config.update({
                     "自定义采集关卡": True,
                     "采集关卡": ["Event_1_夏日骑士", "Story_02_苍蓝魔女"],
+                    "启用召集技能": True,
                     "启用压制技能": suppress,
                     "单章模式": only_once,
                 })
@@ -170,6 +172,47 @@ class MapCollectionTaskScopeTest(unittest.TestCase):
                 self.assertEqual(suppress, SUPPRESS_ACTION in kwargs["battle_actions"])
                 self.assertEqual("本周", task.info["跑图完成范围"])
                 self.assertEqual("2026-10-12", task.info["跑图周期"])
+
+    def test_run_without_summon_only_absorbs(self):
+        task = self.make_task()
+        task.config.update({
+            "自定义采集关卡": True,
+            "采集关卡": ["Event_1_夏日骑士"],
+            "启用召集技能": False,
+            "启用压制技能": True,
+        })
+        calls = []
+
+        class FakeCollector:
+            def __init__(self, *_args):
+                pass
+
+            def run(self, cards, **kwargs):
+                calls.append((cards, kwargs))
+                return CollectionResult(True)
+
+            def scope_complete(self):
+                return True
+
+        progress = SimpleNamespace(
+            load=lambda: None,
+            state=SimpleNamespace(weekly_key="2026-10-12", daily_key="2026-10-13"),
+        )
+        store = MagicMock()
+        store.return_value.__enter__.return_value = progress
+        store.return_value.__exit__.return_value = False
+        navigator = SimpleNamespace(
+            return_home=lambda: NavigationResult(True, ScreenState.HOME),
+        )
+        with (
+            patch.object(map_collection_task_module, "Vision", lambda *_args: object()),
+            patch.object(map_collection_task_module, "ProgressStore", store),
+            patch.object(map_collection_task_module, "Navigator",
+                         lambda *_args: navigator),
+            patch.object(map_collection_task_module, "Collector", FakeCollector),
+        ):
+            self.assertTrue(task.run())
+        self.assertEqual((ABSORB_ACTION,), calls[0][1]["battle_actions"])
 
 
 class CollectorScopeTest(unittest.TestCase):

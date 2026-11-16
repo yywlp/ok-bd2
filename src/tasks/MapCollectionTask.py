@@ -83,7 +83,8 @@ class MapCollectionTask(MapAutomationTaskBase):
             "按周进度依次采集剧情、角色与活动卡带；剧情第6章不参与采集，"
             "可自选卡带、屏蔽卡带或只完成一张。"
             "资源周一08:00、技能次数每日08:00刷新（北京时间）。"
-            "按各卡带路线执行吸收、召集、压制，剩余次数以游戏内识别结果为准。"
+            "按各卡带路线执行吸收、召集、压制，剩余次数以游戏内识别结果为准；"
+            "未持有召集角色时可关闭「启用召集技能」，只执行探查与吸收。"
         )
         self.icon = FluentIcon.GLOBE
         self.group_name = "日常/周常"
@@ -103,6 +104,7 @@ class MapCollectionTask(MapAutomationTaskBase):
                 "单章模式": False,
                 "采集卡带屏蔽": "",
                 "启用压制技能": True,
+                "启用召集技能": False,
             }
         )
         self.config_description.update(
@@ -121,7 +123,15 @@ class MapCollectionTask(MapAutomationTaskBase):
                     "逗号分隔的卡带名或“类别_编号”短前缀，"
                     "如“Story_01_血骑士, Story_3, Character_2, Event_4”；被屏蔽的卡带不采集。"
                 ),
-                "启用压制技能": "关闭后只执行吸收与召集；已完成的部分动作可在后续运行继续核验。",
+                "启用召集技能": (
+                    "「召集」是角色天赋技能，未持有该角色时请保持关闭。"
+                    "关闭后只执行探查与吸收，压制会一并跳过，第 3 号技能位可留空或放其他技能；"
+                    "周进度按「仅吸收」单独记录，日后开启本项需重新跑这些卡带。"
+                ),
+                "启用压制技能": (
+                    "关闭后只执行吸收与召集；已完成的部分动作可在后续运行继续核验。"
+                    "「启用召集技能」关闭时本项不生效。"
+                ),
                 MAP_VISION_THRESHOLD_KEY: "卡带、导航与采集技能模板的最低匹配可信度。",
                 MAP_OCR_THRESHOLD_KEY: "技能次数和按钮识别的最低可信度。",
                 "加载页面等待秒数": "进入卡带或传送后等待加载完成的最长秒数。",
@@ -136,6 +146,7 @@ class MapCollectionTask(MapAutomationTaskBase):
                             "自定义采集关卡",
                             "单章模式",
                             "采集卡带屏蔽",
+                            "启用召集技能",
                             "启用压制技能",
                             MAP_VISION_THRESHOLD_KEY,
                             MAP_OCR_THRESHOLD_KEY,
@@ -167,7 +178,15 @@ class MapCollectionTask(MapAutomationTaskBase):
                 self.log_warning(f"跑图：{error}。")
                 return False
         battle_actions = BATTLE_ACTIONS
-        if not bool(self.config.get("启用压制技能", True)):
+        if not bool(self.config.get("启用召集技能", False)):
+            # Summon is a character talent. Accounts without that character
+            # can only absorb; suppression clears summon-spawned enemies, so
+            # both actions must be dropped together.
+            battle_actions = tuple(
+                action for action in BATTLE_ACTIONS
+                if action.name not in {"召集", "压制"}
+            )
+        elif not bool(self.config.get("启用压制技能", True)):
             battle_actions = tuple(
                 action for action in BATTLE_ACTIONS if action is not SUPPRESS_ACTION
             )

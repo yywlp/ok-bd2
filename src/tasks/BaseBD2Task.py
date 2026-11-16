@@ -36,6 +36,10 @@ from src.utils.home_confirmation import (
     home_left_column_hits,
     home_left_column_p95_brightness,
     home_temporary_announcement_detected,
+    modal_close_point,
+    modal_panel_bbox,
+    news_back_point,
+    news_page_detected,
 )
 from src.utils.image_utils import (
     best_pixel_valid_match,
@@ -409,6 +413,64 @@ class BaseBD2Task(BaseTask):
             self.log_warning(f"日常恢复主页失败：{exc}")
             return False
 
+    def try_return_home_with_back(self, max_presses: int | None = None) -> bool:
+        """自动返回主页失败后的兜底：按返回键逐级退出弹窗/子页面，再复核主页。
+
+        仅在已确认不在主页时才按返回键；每次按键后重新确认，最多
+        ``max_presses`` 次，避免在主页误触发「是否退出游戏」之类的确认框。
+        本方法不改变 ``auto_return_main_home`` 「证据不足即安全停止、绝不盲点」
+        的语义，只在它已经失败后才介入。
+        """
+        presses = (
+            int(self.config.get("回主页返回键兜底次数", 3))
+            if max_presses is None
+            else int(max_presses)
+        )
+        if presses <= 0:
+            return False
+        for attempt in range(1, presses + 1):
+            try:
+                frame = self.capture_frame()
+            except (TaskDisabledException, FinishedException):
+                raise
+            except Exception as exc:
+                self.log_warning(f"尝试返回主页：截图失败：{exc}")
+                return False
+            try:
+                if self._home_scan(frame)[0]:
+                    self._auto_return_home_cooldown_until = 0.0
+                    self.log_info("尝试返回主页：已确认回到主页。")
+                    return True
+            except (TaskDisabledException, FinishedException):
+                raise
+            except Exception as exc:
+                self.log_warning(f"尝试返回主页：主页识别失败：{exc}")
+                return False
+
+            # auto_return_main_home 失败会进入失败冷却；兜底是新一轮主动尝试，
+            # 需要清掉冷却才能让它重新截图和识别。
+            self._auto_return_home_cooldown_until = 0.0
+            self.log_info(
+                f"尝试返回主页：第 {attempt}/{presses} 次按返回键退出当前页面。"
+            )
+            try:
+                self.back(after_sleep=1.0)
+            except (TaskDisabledException, FinishedException):
+                raise
+            except Exception as exc:
+                self.log_warning(f"尝试返回主页：返回键失败：{exc}")
+                return False
+            self._auto_return_home_cooldown_until = 0.0
+            try:
+                if self.auto_return_main_home(notify_failure=False):
+                    return True
+            except (TaskDisabledException, FinishedException):
+                raise
+            except Exception as exc:
+                self.log_warning(f"尝试返回主页：自动返回主页异常：{exc}")
+        self.log_info("尝试返回主页：按返回键兜底后仍未确认主页。")
+        return False
+
     def auto_return_main_home(
         self,
         max_steps: int | None = None,
@@ -523,6 +585,15 @@ class BaseBD2Task(BaseTask):
                 continue
 
             if self._click_top_left_back(frame, step):
+                self.sleep(settle)
+                acted = True
+                continue
+
+            # 新闻/公告整页这类铺满全屏的子页：只有左上角箭头能退出，
+            # 上面两条通用信号都命中不了，用 OCR 标题做最后一次确认。
+            if self.dismiss_fullscreen_news_page(
+                frame, context="自动返回主页",
+            ):
                 self.sleep(settle)
                 acted = True
                 continue
@@ -698,7 +769,171 @@ class BaseBD2Task(BaseTask):
             brightness_threshold=self._home_p95_threshold(),
             gacha_ocr_text=gacha,
             context="自动返回主页",
+            frame=frame,
         )
+
+    def dismiss_home_modal_popup(
+        self,
+        frame,
+        *,
+        context: str = "自动返回主页",
+    ) -> bool:
+        """主页被居中模态弹窗遮挡时，点它右上角的关闭 X。
+
+        只在调用方已确认「主页左列关键词 + 抽抽乐命中，但亮度不足」时调用；
+        取点是面板 bbox 的固定比例，不依赖弹窗文案，因此签到/活动公告等
+        同风格弹窗都能复用。连续多帧面板位置不变时停止，交回固定清理点兜底，
+        避免在关不掉的弹窗上无限点击。
+        """
+        if frame is None:
+            return False
+        now = monotonic()
+        last_click_at = float(getattr(self, "_last_home_modal_close_at", 0.0))
+        bbox = modal_panel_bbox(frame)
+        previous_bbox = getattr(self, "_home_modal_panel_bbox", None)
+        # 同一面板只在 30 秒窗口内累计“点不掉”的次数；超过窗口视为新的一轮，
+        # 避免一次关不掉的弹窗永久把这个入口关死。
+        same_panel = (
+            bbox is not None
+            and bbox == previous_bbox
+            and now - last_click_at < 30.0
+        )
+        repeats = (
+            int(getattr(self, "_home_modal_panel_repeats", 0)) + 1
+            if same_panel
+            else 0
+        )
+        self._home_modal_panel_bbox = bbox
+        self._home_modal_panel_repeats = repeats
+        if bbox is None:
+            self.info_set("主页弹窗", f"{context}：未检测到居中亮面板")
+            return False
+        if repeats >= 4:
+            self.info_set(
+                "主页弹窗",
+                f"{context}：面板连续 {repeats} 次未关闭，改用固定清理点。",
+            )
+            return False
+
+        frame_h, frame_w = frame.shape[:2]
+        point = modal_close_point(bbox, frame_w, frame_h)
+        if point is None:
+            return False
+
+        if now - last_click_at < 1.0:
+            return True
+        self._last_home_modal_close_at = now
+
+        self.info_set(
+            "主页弹窗",
+            f"{context}：面板 {bbox}，点击关闭 "
+            f"({point[0]:.3f},{point[1]:.3f})",
+        )
+        self.log_info(
+            f"{context}：主页被弹窗遮挡（面板 {bbox}），"
+            f"点击右上角关闭 x={point[0]:.2%}, y={point[1]:.2%}。"
+        )
+        self.operate_click(
+            point[0],
+            point[1],
+            name="主页弹窗关闭",
+            after_sleep=0.6,
+        )
+        return True
+
+    def dismiss_fullscreen_news_page(
+        self,
+        frame,
+        *,
+        boxes: object = None,
+        ocr_text: object = None,
+        context: str = "自动返回主页",
+    ) -> bool:
+        """退出铺满全屏的「新闻/公告」页：点左上角返回箭头。
+
+        这类页面亮度均匀、几乎占满画面，``modal_panel_bbox`` 会按面积上限拒绝，
+        固定清理点又落在左侧分类栏（只切换分类），所以旧逻辑会一直循环到超时。
+        这里只在 OCR 明确读到 新闻／公告 标题或左侧分类时才点击，绝不盲点；
+        同一页面点 3 次仍未退出后改用返回键兜底。
+        """
+        width = height = 0
+        if frame is not None:
+            try:
+                height, width = frame.shape[:2]
+            except (AttributeError, ValueError):
+                width = height = 0
+
+        text = ocr_text
+        if text is None:
+            if frame is None:
+                return False
+            try:
+                boxes = list(
+                    self.ocr(
+                        frame=frame,
+                        threshold=float(self.config.get("日常 OCR 阈值", 0.2)),
+                        target_height=720,
+                        log=False,
+                        name=f"{context}整页",
+                    )
+                )
+            except (TaskDisabledException, FinishedException):
+                raise
+            except Exception as exc:
+                self.info_set("整页退出", f"{context}：OCR 失败 {exc}")
+                return False
+            text = " ".join(
+                str(getattr(box, "name", ""))
+                for box in boxes
+                if getattr(box, "name", "")
+            )
+
+        if not news_page_detected(text):
+            self._news_page_back_attempts = 0
+            self.info_set("整页退出", f"{context}：未检测到新闻/公告页")
+            return False
+
+        point = news_back_point(boxes, width, height)
+        now = monotonic()
+        if now - float(getattr(self, "_news_page_back_at", 0.0)) < 1.5:
+            return True
+
+        attempts = int(getattr(self, "_news_page_back_attempts", 0)) + 1
+        self._news_page_back_attempts = attempts
+        self._news_page_back_at = now
+
+        if attempts > 3:
+            self.info_set(
+                "整页退出",
+                f"{context}：新闻/公告页点返回 {attempts - 1} 次未退出，改用返回键。",
+            )
+            self.log_warning(
+                f"{context}：新闻/公告整页返回箭头无效，改用返回键退出。",
+            )
+            try:
+                self.back(after_sleep=1.0)
+            except (TaskDisabledException, FinishedException):
+                raise
+            except Exception as exc:
+                self.log_warning(f"{context}：返回键失败：{exc}")
+            return True
+
+        self.info_set(
+            "整页退出",
+            f"{context}：新闻/公告页，点击左上角返回 "
+            f"({point[0]:.3f},{point[1]:.3f}) 第 {attempts} 次",
+        )
+        self.log_info(
+            f"{context}：检测到新闻/公告整页，点击左上角返回 "
+            f"x={point[0]:.2%}, y={point[1]:.2%}。"
+        )
+        self.operate_click(
+            point[0],
+            point[1],
+            name="新闻页返回",
+            after_sleep=0.8,
+        )
+        return True
 
     def _quick_vision(self):
         from src.tasks.map_trade.vision import Vision
@@ -975,6 +1210,7 @@ class BaseBD2Task(BaseTask):
         brightness_threshold: float,
         gacha_ocr_text: object,
         context: str,
+        frame: object | None = None,
     ) -> bool:
         """Clear a dimming announcement only when the other two home signals pass."""
         if not home_temporary_announcement_detected(
@@ -985,6 +1221,9 @@ class BaseBD2Task(BaseTask):
             gacha_ocr_text=gacha_ocr_text,
         ):
             return False
+
+        if frame is not None and self.dismiss_home_modal_popup(frame, context=context):
+            return True
 
         now = monotonic()
         last_click_at = float(
