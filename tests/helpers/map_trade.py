@@ -18,8 +18,11 @@ class FakeTask:
         self.clicks = []
         self.infos = []
 
-    def operate_click(self, x, y, after_sleep=0):
+    def operate_click(self, x, y, after_sleep=0, **_kwargs):
         self.clicks.append((x, y, after_sleep))
+
+    def operate(self, callback):
+        return callback()
 
     def capture_frame(self):
         return np.zeros((720, 1280, 3), dtype=np.uint8)
