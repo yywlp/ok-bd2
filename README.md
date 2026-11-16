@@ -1,7 +1,7 @@
 <div align="center">
   <img src="icons/icon.png" alt="ok-bd2 icon" width="180">
 
-  <h1>ok-bd2</h1>
+  <h1>ok-bd2 · yywlp 个人维护分支</h1>
 
   <p>一款基于图像识别的 <strong>BrownDust II</strong> Windows PC 自动化辅助工具。</p>
   <p>基于 <a href="https://github.com/ok-oldking/ok-script">ok-script</a> 框架开发。</p>
@@ -9,11 +9,58 @@
   <p>
     <img src="https://img.shields.io/badge/platform-Windows-blue" alt="platform">
     <img src="https://img.shields.io/badge/python-3.12-skyblue" alt="python">
-    <a href="https://github.com/GodRaymond233/ok-bd2/releases"><img src="https://img.shields.io/github/v/release/GodRaymond233/ok-bd2" alt="release"></a>
-    <a href="https://github.com/GodRaymond233/ok-bd2/releases"><img src="https://img.shields.io/github/downloads/GodRaymond233/ok-bd2/total" alt="downloads"></a>
+    <a href="https://github.com/yywlp/ok-bd2"><img src="https://img.shields.io/badge/fork-yywlp-blue" alt="yywlp fork"></a>
     <a href="./LICENSE"><img src="https://img.shields.io/github/license/GodRaymond233/ok-bd2" alt="license"></a>
   </p>
 </div>
+
+## 来源与本分支说明
+
+本仓库由 [yywlp](https://github.com/yywlp) 个人维护，Fork 自
+[GodRaymond233/ok-bd2](https://github.com/GodRaymond233/ok-bd2)，
+底层基于 [ok-oldking/ok-script](https://github.com/ok-oldking/ok-script) 框架。
+原项目的核心功能、架构与资源主要来自上游作者及贡献者，感谢他们的开发与维护。
+本分支保留原项目的 [GPL-3.0 许可证](./LICENSE) 与第三方声明。
+
+我会根据自己使用过程中遇到的问题，持续尝试修复和改进，并加入一些个人需要的自动化功能。
+如果你也遇到类似问题，欢迎尝试这个分支；也欢迎通过本仓库的 Pull Request 反馈和改进。
+这里是个人维护的试用分支，更新节奏与上游可能不同，改动效果会受到游戏版本、分辨率和账号状态影响。
+本分支的修改与说明由我维护，不代表上游作者对这些改动提供支持或认可。
+
+### 目前包含的改动
+
+- **免费抽抽乐复核**：兼容“抽1次”被 OCR 识别为“拍1次”的情况，减少抽取成功后误报未完成。
+- **每日及每周奖励**：自动检查任务页的“全部获得”，在一键日常末尾统一领奖，支持同日复查新增奖励。
+- **格鲁 TALK**：新增未读会话检查、回复及剧情推进，提供仅探测模式与点击上限。
+- **主页与弹窗处理**：补充公告、新闻页、模态弹窗识别和返回主页的兜底处理。
+- **PVP 鸡尾酒策略**：免费次数不可用时尝试退出并继续后续日常；另提供使用库存非免费鸡尾酒的开关，默认关闭。
+- **每周跑图**：可关闭召集技能，供未持有对应角色的账号使用，并区分不同技能配置下的进度。
+
+### 如何试用本分支
+
+本分支目前提供源码改动。下文保留的上游 Releases 和网盘链接用于下载**上游安装包**，
+它们不包含本分支新增的修改；要体验本分支，请使用这里的源码运行步骤。
+
+需要 Windows、Python 3.12、[uv](https://docs.astral.sh/uv/) 和 Node.js 24 或更高版本。
+在 PowerShell 中执行：
+
+```powershell
+git clone https://github.com/yywlp/ok-bd2.git
+cd ok-bd2
+uv sync --frozen
+npm --prefix desktop/ui ci --no-audit --no-fund
+npm --prefix desktop/ui run build
+npm --prefix desktop/shell ci --no-audit --no-fund
+npm --prefix desktop/shell run pack:win
+uv run --frozen python main.py
+```
+
+如需调试，将最后一条改为 `uv run --frozen python main_debug.py`。
+首次构建需联网下载依赖与 Electron 组件。使用过程中如遇问题，请描述游戏所处页面、
+任务配置、预期和实际行为，并在公开分享日志或截图前检查是否含有个人信息。
+
+本仓库仍保留上游的发布与更新配置；从上游安装包自动更新不会获取本 Fork 的修改。
+后续如发布本分支专用安装包，会在这里单独说明。
 
 ## 免责声明
 
@@ -72,7 +119,7 @@ BrownDust II.
 
 ## 安装指南
 
-### 方式一：使用安装包
+### 方式一：使用上游安装包
 
 适合普通用户。前往
 [Releases](https://github.com/GodRaymond233/ok-bd2/releases)
@@ -89,17 +136,19 @@ BrownDust II.
 - [夸克网盘](https://pan.quark.cn/s/80730a808d0e)：免费下载。
 - [百度网盘](https://pan.baidu.com/s/102Mh1djq2B1T-cIJhct9Gg?pwd=okww)：免费下载，提取码：`okww`。
 
-### 方式二：从源码运行
+### 方式二：从本分支源码运行
 
 适合开发、调试或二次适配。
 
 ```powershell
-git clone https://github.com/GodRaymond233/ok-bd2.git
+git clone https://github.com/yywlp/ok-bd2.git
 cd ok-bd2
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python main_debug.py
+uv sync --frozen
+npm --prefix desktop/ui ci --no-audit --no-fund
+npm --prefix desktop/ui run build
+npm --prefix desktop/shell ci --no-audit --no-fund
+npm --prefix desktop/shell run pack:win
+uv run --frozen python main.py
 ```
 
 项目依赖以 `pyproject.toml` 和 `uv.lock` 为唯一锁定来源，
