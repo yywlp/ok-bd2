@@ -355,23 +355,22 @@ class GlutalkTaskSafetyTest(unittest.TestCase):
         self.assertEqual(2, task._last_episode)
         self.assertIn("停止点击", task.info["状态"])
 
-    def test_stage_loop_reopens_glutalk_only_after_an_ended_episode(self):
-        import numpy as np
+    def test_stage_loop_reopens_after_end_and_rechecks_an_idle_page_once(self):
+        from unittest.mock import Mock
+
         task = make_probe_task(仅探测模式=False)
-        task._advance_stage = lambda stage: "ended" if stage == 1 else "idle"
-        calls = {"restart": 0}
 
-        def restart():
-            calls["restart"] += 1
-            return True
+        def advance(stage):
+            if stage == 1:
+                task._click_total += 1
+                return "ended"
+            return "idle"
 
-        task._restart_from_home = restart
-        task._has_new_stage = lambda *_a, **_k: True
-        task._read = lambda: (
-            np.zeros((REAL_H, REAL_W, 3), dtype=np.uint8), [], "",
-        )
+        task._advance_stage = advance
+        task._restart_from_home = Mock(return_value=True)
+        task._wait_for_next_stage = Mock(side_effect=[True, False])
         self.assertTrue(task._scan())
-        self.assertEqual(1, calls["restart"])
+        self.assertEqual(2, task._restart_from_home.call_count)
         self.assertEqual(1, task.info["完成对话数"])
 
     def test_same_episode_history_is_not_a_new_stage(self):
