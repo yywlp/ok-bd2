@@ -197,7 +197,32 @@ class NewsPageClickTest(unittest.TestCase):
                 )
         self.assertEqual(3, len(task.clicks))
         self.assertEqual(1, len(task.back_calls))
-        self.assertIn("返回键", task.info["整页退出"])
+
+    def test_stops_after_repeated_popup_news_cycles(self):
+        """复现 14:00 的死循环：弹窗 → 点开公告 → 退出 → 又回到弹窗。"""
+        task = _base_task()
+        ticks = iter(range(10, 900, 5))
+        results = []
+        messages = []
+        with patch(
+            "src.tasks.BaseBD2Task.monotonic", side_effect=lambda: next(ticks),
+        ):
+            for _ in range(4):
+                results.append(
+                    task.dismiss_fullscreen_news_page(
+                        _blank_frame(), ocr_text=REAL_NEWS_TEXT,
+                    )
+                )
+                messages.append(task.info.get("整页退出", ""))
+                # 退出后回到遮挡主页的弹窗：不是新闻页，attempts 归零，
+                # 下一次再进公告详情页就是「新的一轮」。
+                task.dismiss_fullscreen_news_page(
+                    _blank_frame(), ocr_text=HOME_TEXT,
+                )
+        self.assertEqual([True, True, True, False], results)
+        self.assertEqual(3, len(task.clicks))
+        self.assertTrue(task._news_page_loop_detected)
+        self.assertIn("循环", messages[-1])
 
     def test_ocr_is_skipped_when_text_supplied(self):
         task = _base_task()

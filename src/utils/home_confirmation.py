@@ -46,17 +46,29 @@ HOME_LEFT_COLUMN_REQUIRED_HITS = 2
 # 且不随主页背景场景变化（旧模板相对亮度比值依赖采集场景，已废弃）。
 HOME_DIMMED_P95_THRESHOLD_DEFAULT = 185.0
 
-# 遮挡主页的模态弹窗（登录加成、签到、活动公告等）：面板自身亮、四周被压暗，
-# 关闭 X 固定在面板右上角内侧。2026-11-16 用「登录加成」实机帧标定：
-# 1920x1080 帧面板 bbox=(424,178,1081,641)，X 中心 (1480,285)，
-# 折算面板内相对位置 (0.977, 0.167)。仅按几何比例取点，不依赖弹窗文案，
-# 因此任何同风格居中面板弹窗都可复用。
+# 遮挡主页的模态弹窗（登录加成、签到、公告板等）：面板自身亮、四周被压暗。
 MODAL_PANEL_BRIGHTNESS_THRESHOLD = 150
 MODAL_PANEL_MIN_AREA_RATIO = 0.06
 MODAL_PANEL_MAX_AREA_RATIO = 0.85
 MODAL_PANEL_MIN_SIDE_RATIO = 0.18
 MODAL_PANEL_CENTER_RANGE = (0.20, 0.80, 0.15, 0.85)
 MODAL_PANEL_DETECT_MAX_SIDE = 960
+
+# 关闭按钮不再按面板的固定比例估算。2026-11-16 实机对比两种弹窗：
+#   「公告板」面板 1600x1220，X 中心在面板内 (0.960, 0.058)；
+#   「登录加成」面板 1081x641，X 中心在面板内 (0.977, 0.160)。
+# 两者纵向差 3 倍（头部高度不同），用同一个比例必然点到第一条公告上，
+# 于是「打开公告 -> 退出 -> 再打开」的死循环。改成在面板右上角区域直接找
+# 叉号字形：用局部中值背景差分，深色 ✕（白底）和浅色 ✕（彩色底）都命中。
+MODAL_CLOSE_GLYPH_ROI = (0.60, 0.0, 1.0, 0.26)
+MODAL_CLOSE_GLYPH_CONTRAST = 32
+MODAL_CLOSE_GLYPH_MEDIAN_RATIO = 0.035
+MODAL_CLOSE_GLYPH_SIDE_RATIO = (0.010, 0.050)
+MODAL_CLOSE_GLYPH_ASPECT_RANGE = (0.6, 1.7)
+MODAL_CLOSE_GLYPH_FILL_RANGE = (0.10, 0.65)
+# 距面板右上角太近的连通域是圆角/描边伪影，不是按钮字形。
+MODAL_CLOSE_GLYPH_EDGE_INSET = (0.018, 0.030)
+# 仅在没有传入画面（旧调用/离线标定）时使用的估算比例。
 MODAL_CLOSE_RELATIVE_IN_PANEL = (0.977, 0.167)
 
 # 「新闻/公告」整页（从主页公告横幅/活动入口进入）：画面几乎铺满且亮度均匀，
@@ -287,17 +299,126 @@ def modal_panel_bbox(frame) -> tuple[int, int, int, int] | None:
     )
 
 
+def modal_close_glyph(
+    frame,
+    bbox: tuple[int, int, int, int] | None,
+) -> tuple[float, float] | None:
+    """Return the relative position of the panel's ✕ close button.
+
+    The button is a small, roughly square glyph near the panel's top-right
+    corner.  Instead of assuming one fixed inset (different popups have
+    different header heights and the guess lands on content), the glyph is
+    found by local-contrast blobs: the crop is compared against its own median
+    background, so a dark ✕ on white and a light ✕ on a coloured bar both
+    survive.  Corner-radius shadows are dropped by an edge-inset rule.
+
+    Returns ``None`` when no confident glyph exists — callers must then not
+    click at all instead of guessing, because a wrong click lands on the
+    popup's own list rows and opens them.
+    """
+    if frame is None or bbox is None:
+        return None
+    gray = to_gray(frame)
+    if gray.size == 0:
+        return None
+    frame_height, frame_width = gray.shape[:2]
+    try:
+        left, top, panel_width, panel_height = (int(value) for value in bbox)
+    except (TypeError, ValueError):
+        return None
+    if panel_width <= 0 or panel_height <= 0:
+        return None
+
+    roi_x0 = max(0, left + int(panel_width * MODAL_CLOSE_GLYPH_ROI[0]))
+    roi_x1 = min(frame_width, left + int(panel_width * MODAL_CLOSE_GLYPH_ROI[2]))
+    roi_y0 = max(0, top + int(panel_height * MODAL_CLOSE_GLYPH_ROI[1]))
+    roi_y1 = min(frame_height, top + int(panel_height * MODAL_CLOSE_GLYPH_ROI[3]))
+    if roi_x1 - roi_x0 < 16 or roi_y1 - roi_y0 < 16:
+        return None
+
+    crop = gray[roi_y0:roi_y1, roi_x0:roi_x1]
+    kernel = max(
+        15, min(81, int(round(panel_width * MODAL_CLOSE_GLYPH_MEDIAN_RATIO)) | 1),
+    )
+    if min(crop.shape[:2]) <= kernel:
+        return None
+    background = cv2.medianBlur(crop, kernel).astype(np.int16)
+    difference = np.abs(crop.astype(np.int16) - background)
+    mask = (difference >= MODAL_CLOSE_GLYPH_CONTRAST).astype(np.uint8)
+    try:
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            mask, 8,
+        )
+    except cv2.error:
+        return None
+
+    crop_height, crop_width = crop.shape[:2]
+    min_side, max_side = MODAL_CLOSE_GLYPH_SIDE_RATIO
+    min_aspect, max_aspect = MODAL_CLOSE_GLYPH_ASPECT_RANGE
+    min_fill, max_fill = MODAL_CLOSE_GLYPH_FILL_RANGE
+    inset_x, inset_y = MODAL_CLOSE_GLYPH_EDGE_INSET
+    best_key: float | None = None
+    best_point: tuple[float, float] | None = None
+    for index in range(1, count):
+        x, y, width, height, area = (
+            int(value) for value in stats[index][:5]
+        )
+        if width <= 0 or height <= 0:
+            continue
+        # 贴住裁剪边界的是面板边框/圆角，不是按钮。
+        if (
+            x <= 1
+            or y <= 1
+            or x + width >= crop_width - 1
+            or y + height >= crop_height - 1
+        ):
+            continue
+        side = max(width, height)
+        if not (min_side * panel_width <= side <= max_side * panel_width):
+            continue
+        aspect = width / float(height)
+        if not (min_aspect <= aspect <= max_aspect):
+            continue
+        fill = area / float(width * height)
+        if not (min_fill <= fill <= max_fill):
+            continue
+        center_x = roi_x0 + x + width / 2.0
+        center_y = roi_y0 + y + height / 2.0
+        relative_x = (center_x - left) / float(panel_width)
+        relative_y = (center_y - top) / float(panel_height)
+        if (1.0 - relative_x) < inset_x or relative_y < inset_y:
+            continue
+        # 关闭按钮是离右上角最近的那个字形。
+        key = (left + panel_width - center_x) + (center_y - top) * 0.5
+        if best_key is None or key < best_key:
+            best_key = key
+            best_point = (
+                min(1.0, max(0.0, center_x / frame_width)),
+                min(1.0, max(0.0, center_y / frame_height)),
+            )
+    return best_point
+
+
 def modal_close_point(
     bbox: tuple[int, int, int, int] | None,
     width: int,
     height: int,
+    *,
+    frame=None,
 ) -> tuple[float, float] | None:
-    """Map a modal panel bbox to the relative position of its close button."""
+    """Map a modal panel bbox to the relative position of its close button.
+
+    With ``frame`` the position comes from the ✕ glyph itself and returns
+    ``None`` when it cannot be located (never guess).  Without ``frame`` the
+    legacy fixed inset is used, which stays for offline calibration only.
+    """
     if bbox is None or width <= 0 or height <= 0:
         return None
     left, top, panel_width, panel_height = (float(value) for value in bbox)
     if panel_width <= 0 or panel_height <= 0:
         return None
+    if frame is not None:
+        return modal_close_glyph(frame, bbox)
     offset_x, offset_y = MODAL_CLOSE_RELATIVE_IN_PANEL
     x = left + panel_width * offset_x
     y = top + panel_height * offset_y

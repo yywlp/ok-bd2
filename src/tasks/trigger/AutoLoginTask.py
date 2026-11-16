@@ -710,11 +710,25 @@ class AutoLoginTask(BaseBD2Task):
             )
             return
 
+        if frame is not None and getattr(self, "_home_modal_unlocated", False):
+            # 面板在但叉号定位不到：固定清理点会点到公告条目上，把公告打开，
+            # 退出后又回到同一个弹窗，形成死循环。这里只等待，不盲点。
+            self._set_action("检测到弹窗但找不到关闭叉号，等待其消失，不盲点。")
+            self._last_clear_click_at = now
+            return
+
         if frame is not None and self.dismiss_fullscreen_news_page(
             frame, context="自动登录",
         ):
             self._last_clear_click_at = now
             self._set_action("检测到新闻/公告整页，点击左上角返回。")
+            return
+
+        if getattr(self, "_news_page_loop_detected", False):
+            # 已经在「弹窗 -> 公告详情 -> 退出 -> 弹窗」之间循环过，停止一切点击，
+            # 让状态机按超时结束，避免继续点开公告。
+            self._set_action("检测到公告页与弹窗循环，停止点击等待人工处理。")
+            self._last_clear_click_at = now
             return
 
         # 刚退出新闻/公告页时不要马上按固定清理点盲点：那个位置在主页上

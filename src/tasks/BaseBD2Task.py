@@ -778,12 +778,13 @@ class BaseBD2Task(BaseTask):
         *,
         context: str = "自动返回主页",
     ) -> bool:
-        """主页被居中模态弹窗遮挡时，点它右上角的关闭 X。
+        """主页被模态弹窗遮挡时，点它右上角的关闭 X。
 
-        只在调用方已确认「主页左列关键词 + 抽抽乐命中，但亮度不足」时调用；
-        取点是面板 bbox 的固定比例，不依赖弹窗文案，因此签到/活动公告等
-        同风格弹窗都能复用。连续多帧面板位置不变时停止，交回固定清理点兜底，
-        避免在关不掉的弹窗上无限点击。
+        只在调用方已确认「主页左列关键词 + 抽抽乐命中，但亮度不足」时调用。
+        关闭点由面板右上角的叉号字形定位（见 ``modal_close_glyph``），
+        找不到就绝不点击：这类弹窗的内容就是公告条目，猜偏一点就会把公告
+        打开，退出后又回到同一个弹窗，形成「点开公告 → 退出 → 再点开」的
+        死循环。连续多帧同一个面板仍关不掉时停止点击，交给调用方处理。
         """
         if frame is None:
             return False
@@ -806,19 +807,31 @@ class BaseBD2Task(BaseTask):
         self._home_modal_panel_bbox = bbox
         self._home_modal_panel_repeats = repeats
         if bbox is None:
+            self._home_modal_unlocated = False
             self.info_set("主页弹窗", f"{context}：未检测到居中亮面板")
             return False
         if repeats >= 4:
+            self._home_modal_unlocated = True
             self.info_set(
                 "主页弹窗",
-                f"{context}：面板连续 {repeats} 次未关闭，改用固定清理点。",
+                f"{context}：面板连续 {repeats} 次未关闭，停止点击以免误触内容。",
             )
             return False
 
         frame_h, frame_w = frame.shape[:2]
-        point = modal_close_point(bbox, frame_w, frame_h)
+        point = modal_close_point(bbox, frame_w, frame_h, frame=frame)
         if point is None:
+            self._home_modal_unlocated = True
+            self.info_set(
+                "主页弹窗",
+                f"{context}：面板 {bbox}，未定位到关闭叉号，不点击。",
+            )
+            self.log_info(
+                f"{context}：检测到弹窗面板 {bbox} 但找不到关闭叉号，"
+                "为避免点到公告条目，本次不点击。"
+            )
             return False
+        self._home_modal_unlocated = False
 
         if now - last_click_at < 1.0:
             return True
@@ -899,8 +912,29 @@ class BaseBD2Task(BaseTask):
             return True
 
         attempts = int(getattr(self, "_news_page_back_attempts", 0)) + 1
+        # 防循环：attempts==1 表示这是「重新识别到新闻页」的新一轮。如果在 90 秒
+        # 内反复出现这种新的一轮（每次退出后又回到同一个遮挡主页的弹窗），说明
+        # 上层弹窗没关掉，继续点只会无限重复，于是停下交给调用方报失败。
+        if attempts == 1:
+            history = [
+                stamp
+                for stamp in getattr(self, "_news_page_back_history", ())
+                if now - stamp < 90.0
+            ]
+            if len(history) >= 3:
+                self._news_page_back_history = history
+                self._news_page_loop_detected = True
+                message = (
+                    f"{context}：90 秒内已从新闻/公告页退出 {len(history)} 次，"
+                    "疑似在弹窗与公告页之间循环，停止点击。"
+                )
+                self.info_set("整页退出", message)
+                self.log_warning(message, notify=True)
+                return False
+            self._news_page_back_history = history + [now]
         self._news_page_back_attempts = attempts
         self._news_page_back_at = now
+        self._news_page_loop_detected = False
 
         if attempts > 3:
             self.info_set(
@@ -1222,8 +1256,23 @@ class BaseBD2Task(BaseTask):
         ):
             return False
 
-        if frame is not None and self.dismiss_home_modal_popup(frame, context=context):
-            return True
+        if frame is not None:
+            if self.dismiss_home_modal_popup(frame, context=context):
+                return True
+            if getattr(self, "_home_modal_unlocated", False):
+                # 面板还在、关闭叉号也定位不到：固定清理点在「公告板」这类弹窗上
+                # 正好落在公告条目里，点下去会打开公告，退出后又回到同一个弹窗，
+                # 于是「打开公告 -> 退出 -> 再打开」无限循环。宁可等它自己消失。
+                self.info_set(
+                    "主页临时公告",
+                    f"{context}：弹窗未能关闭，跳过固定清理点（避免点开公告）。",
+                )
+                self.log_info(
+                    f"{context}：弹窗面板存在但无法定位关闭按钮，"
+                    "跳过固定清理点，等待弹窗自行消失。"
+                )
+                self.sleep(1.0)
+                return True
 
         now = monotonic()
         last_click_at = float(
