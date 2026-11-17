@@ -73,6 +73,16 @@ REWARD_POPUP_HINT_ROI = _main_story_roi(800, 940, 1100, 1030)
 # 弹窗关闭点：底部「点击画面即可返回」文字所在区域，点它即关闭弹窗。
 REWARD_POPUP_CLOSE_POINT = (953, 989)
 
+# 2026-11-17 实机故障：第 7 轮结算后的「可获得奖励 / 1,110 / 点击画面即可返回」
+# 弹窗，只点一次底部提示区后画面 20 秒完全静止，任务因此停机。底部 y≈91.6% 很
+# 可能落在弹窗可点区之外（或被模态遮罩吞掉）。改为「中心 ↔ 底部提示」交替多点
+# 几次，仍不动再按 ESC，都无效才判定卡住。
+REWARD_POPUP_CENTER_POINT = (960, 700)
+
+REWARD_POPUP_ATTEMPTS = 3
+
+REWARD_POPUP_ATTEMPT_SECONDS = 4.0
+
 # 结算页顶部标题，用于区分「真结算」与其它带「离开」的弹窗。
 VICTORY_TITLE_ROI = _main_story_roi(1250, 20, 1900, 210)
 
@@ -330,9 +340,7 @@ class MainStoryFeatureMixin:
             if state is MainStoryState.REWARD_POPUP:
                 busy_since, busy_announced = None, False
                 unknown_since = None
-                self.log_info("主线刷取：奖励弹窗，点击关闭。")
-                self._click_reference(*REWARD_POPUP_CLOSE_POINT)
-                if self._main_story_wait_change(state, wait_seconds, threshold):
+                if self._main_story_dismiss_reward_popup(state, threshold):
                     continue
                 return self._main_story_stuck(frame, "点击「奖励弹窗」后界面无变化")
 
@@ -456,6 +464,45 @@ class MainStoryFeatureMixin:
                 self.info_set("主线当前界面", f"{state.value}｜{evidence}")
                 return True
         return False
+
+    def _main_story_dismiss_reward_popup(
+        self,
+        state: MainStoryState,
+        threshold: float,
+    ) -> bool:
+        """关闭奖励弹窗；成功（界面离开该状态）返回 True。
+
+        中心点与底部提示区交替点击，最多 REWARD_POPUP_ATTEMPTS 次；仍无变化再按
+        一次 ESC 兜底。任何一步看到界面变化都立即返回，不再多点。
+        """
+
+        for attempt in range(REWARD_POPUP_ATTEMPTS):
+            point = (
+                REWARD_POPUP_CENTER_POINT
+                if attempt % 2 == 0
+                else REWARD_POPUP_CLOSE_POINT
+            )
+            self.log_info(f"主线刷取：奖励弹窗，第 {attempt + 1} 次点击 {point} 关闭。")
+            self._click_reference(*point)
+            if self._main_story_wait_change(
+                state,
+                REWARD_POPUP_ATTEMPT_SECONDS,
+                threshold,
+            ):
+                return True
+
+        self.log_info("主线刷取：奖励弹窗点击无效，尝试按 ESC。")
+        try:
+            self.send_key("esc")
+        except Exception as exc:
+            # 键位不受支持时不要连带中断整轮，交给上层按卡住处理。
+            self.info_set("主线 ESC 错误", str(exc))
+            return False
+        return self._main_story_wait_change(
+            state,
+            REWARD_POPUP_ATTEMPT_SECONDS,
+            threshold,
+        )
 
     def _main_story_set_stats(self, battles: int, autos: int, cycles: int) -> None:
         self.info_set("主线战斗次数", battles)
