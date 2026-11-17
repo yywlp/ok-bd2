@@ -164,6 +164,7 @@ config = {
         ["src.tasks.PVPTask", "PVPTask"],
         ["src.tasks.MissionRewardTask", "MissionRewardTask"],
         ["src.tasks.GlutalkTask", "GlutalkTask"],
+        ["src.tasks.MainStoryFarmTask", "MainStoryFarmTask"],
         ["src.tasks.BD2InputTestTask", "BD2MouseClickInputTestTask"],
         ["src.tasks.BD2InputTestTask", "BD2MouseWheelInputTestTask"],
         ["src.tasks.LauncherTask", "LauncherTask"],
