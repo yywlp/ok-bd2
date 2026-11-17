@@ -56,6 +56,12 @@ UNLOCK_BACK_TEMPLATE = TemplateSpec(
     relative_roi=(0.0, 0.0, .15, .12),
 )
 
+# 2026-11-17 实机测得的另一种插图页：右侧中部的关闭「×」（OCR 读作 C，
+# 中心约 (0.924, 0.564)），只在没有左上返回条时使用。
+UNLOCK_CLOSE_POINT = (0.924, 0.564)
+
+UNLOCK_ATTEMPTS = 4
+
 
 class GlutalkTask(TaskVisionMixin, BaseBD2Task):
     status_keys = [
@@ -328,14 +334,34 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
             action: TalkAction | None = None
 
             if view.page == "unlock":
-                if unlock_attempts >= 2 or not self._click_template(frame, UNLOCK_BACK_TEMPLATE):
-                    self.info_set("状态", "未能退出好感度特效解锁页，停止重复点击。")
+                # 2026-11-17 实机：这一版「获得好感度特效！」插图页没有左上返回条
+                # （界面控件自动隐藏），只有底部「获得好感度特效！/主界面设置」
+                # 和右侧中部的关闭「×」（OCR 读成 C）。原先只认返回条，匹配不上
+                # 就立刻判失败。改为分步尝试：返回条 → ESC → 右侧关闭位 → 画面中央，
+                # 每步之后都重新判页面，退出即继续。
+                if unlock_attempts >= UNLOCK_ATTEMPTS:
+                    self.info_set("状态", "好感度特效解锁页多次尝试仍无法退出，停止。")
                     return "failed"
                 unlock_attempts += 1
                 clicks += 1
                 self._click_total += 1
                 idle = 0
                 self.info_set("推进点击数", self._click_total)
+                if self._click_template(frame, UNLOCK_BACK_TEMPLATE):
+                    self.info_set("解锁页处理", f"第 {unlock_attempts} 次：点左上返回条")
+                elif unlock_attempts == 1:
+                    self.info_set("解锁页处理", "第 1 次：无返回条，按 ESC 尝试关闭")
+                    self.send_key("esc")
+                elif unlock_attempts == 2:
+                    self.info_set("解锁页处理", "第 2 次：点击右侧关闭位")
+                    self.operate_click(
+                        *UNLOCK_CLOSE_POINT, name="格鲁TALK特效页关闭", after_sleep=0.3,
+                    )
+                else:
+                    self.info_set("解锁页处理", f"第 {unlock_attempts} 次：点击画面中央")
+                    self.operate_click(
+                        0.5, 0.5, name="格鲁TALK特效页中央", after_sleep=0.3,
+                    )
                 self.sleep(interval)
                 continue
 
