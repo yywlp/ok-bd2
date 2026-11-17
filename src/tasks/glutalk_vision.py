@@ -19,6 +19,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+import cv2
+
+from src.utils.image_utils import relative_roi_frame
 from src.utils.ocr_utils import normalize_ocr_text
 
 REFERENCE_WIDTH = 1920
@@ -52,6 +55,8 @@ EXHAUSTED_KEYWORDS = (
 )
 POPUP_KEYWORDS = (
     "获得物品", "获得奖励", "获得道具", "点击画面即可返回", "奖励获得",
+    "是否要进行相遇事件",
+    "获得好感度奖励",
 )
 
 # Positive evidence that a list row can be talked to. Deliberately narrow:
@@ -64,7 +69,9 @@ AVAILABLE_TASK_BLOCK_KEYWORDS = (
     # "未读消息 1" is a summary/header, never a clickable conversation row.
     "未读消息",
 )
-AVAILABLE_TASK_RELATIVE_ROI = (0.22, 0.15, 0.96, 0.92)
+# Character rows are confined to the left pane. The right pane's empty-state
+# text "开始对话吧" is an instruction, not a conversation button.
+AVAILABLE_TASK_RELATIVE_ROI = (0.25, 0.28, 0.52, 0.84)
 
 # Blue numeric badge at the right edge of an unread conversation row.
 # Measured: "1" at (1916,1192,68,66) -> center (0.508, 0.567) on 3840x2160.
@@ -82,6 +89,8 @@ REPLY_EXCLUDE_KEYWORDS = (
     "发送消息", "未读消息", "跳过", "skip", "auto", "返回", "关闭", "取消",
     "剩余相遇", "glutalk", "回放相遇事件", "对话结束", "对话结来", "对话结東",
     "代号", "心契之约", "max", "相遇事件",
+    "开始对话吧",
+    "服装信息", "联系方式", "未拥有",
 )
 
 # The "X" at the right of the blue GLU TALK title bar, measured at
@@ -91,18 +100,21 @@ CLOSE_RELATIVE_ROI = (0.72, 0.20, 0.84, 0.32)
 CHOICE_KEYWORDS = ("选择", "选项", "确认", "确定", "下一步")
 DISMISS_KEYWORDS = ("点击画面即可返回", "关闭", "返回")
 
-_REMAINING_RE = re.compile(r"剩余相遇(\d+)")
-_UNREAD_RE = re.compile(r"未读消息(\d+)")
+_REMAINING_RE = re.compile(r"剩余相遇\s*[|｜丨:：]*\s*([0-3０-３])(?!\d)")
+_UNREAD_RE = re.compile(r"未读消息\s*(\d+)")
 _DIALOGUE_END_RE = re.compile(
     r"(?:ep\d+)?[.．、]?\s*对话结[束来東]|对话完[成毕]",
 )
 _EPISODE_RE = re.compile(r"ep(\d+)[.．、]?\s*对话结[束来東]")
 _CHAPTER_MARKER_RE = re.compile(r"^ep\d+")
+_NEW_FATE_RE = re.compile(r"^新的缘分([1-9]\d*)$")
+_FATE_HEADER_RE = re.compile(r"^(?:新的)?缘分(?:列表)?\d*$")
+CONVERSATION_TAB_BADGE_ROI = (.21, .36, .25, .45)
 
 
 @dataclass(frozen=True)
 class TalkView:
-    page: str = "unknown"  # list | dialogue | popup | unknown
+    page: str = "unknown"  # list | dialogue | popup | unlock | unknown
     diagnostics: str = ""
     evidence: tuple[str, ...] = ()
 
@@ -153,13 +165,14 @@ def matched_keywords(text: object, keywords) -> tuple[str, ...]:
 
 def remaining_encounters(text: object) -> int | None:
     """Parse "今日的剩余相遇0" -> 0. None when OCR did not read the counter."""
-    match = _REMAINING_RE.search(_plain(text))
+    # Keep OCR box separators: "剩余相遇0 36:18" must not become quota 36.
+    match = _REMAINING_RE.search(str(text))
     return int(match.group(1)) if match else None
 
 
 def unread_count(text: object) -> int | None:
     """Parse "未读消息 1" -> 1. None when OCR did not read the summary."""
-    match = _UNREAD_RE.search(_plain(text))
+    match = _UNREAD_RE.search(str(text))
     return int(match.group(1)) if match else None
 
 
@@ -242,25 +255,30 @@ def home_talk_entry(boxes, width: int, height: int) -> tuple[float, float] | Non
 def classify_talk_page(text: object) -> TalkView:
     """Classify the current frame without ever assuming an unknown page is safe.
 
-    A full-screen story dialogue wins over the GLU TALK window because SKIP/AUTO
-    buttons cannot appear on the chat list. The global bottom navigation items
-    (剧情/任务/背包/…) are intentionally NOT dialogue keywords.
+    The GLU TALK header and counters identify the chat window even when a
+    message contains "跳过" (e.g. "我从来没跳过舞"). The global bottom navigation
+    items (剧情/任务/背包/…) are intentionally NOT dialogue keywords.
     """
     normalized = _norm(text)
     if not normalized:
         return TalkView("unknown", "OCR 为空，未取得任何页面证据")
+    if "获得好感度特效" in normalized and "主界面设置" in normalized:
+        return TalkView("unlock", "识别到好感度特效解锁页", ("获得好感度特效", "主界面设置"))
 
     popup_hits = matched_keywords(normalized, POPUP_KEYWORDS)
     if popup_hits:
         return TalkView("popup", "识别到奖励/确认弹窗", popup_hits)
-
-    dialogue_hits = matched_keywords(normalized, DIALOGUE_KEYWORDS)
-    if dialogue_hits:
-        return TalkView("dialogue", "", dialogue_hits)
+    if all(word in normalized for word in (
+        "跳过对话", "可通过格鲁talk简介相遇事件", "取消", "确认",
+    )):
+        return TalkView("popup", "识别到相遇剧情跳过确认窗", ("跳过对话",))
 
     inner_hits = matched_keywords(normalized, INNER_PAGE_KEYWORDS)
     if len(inner_hits) >= INNER_PAGE_MIN_HITS:
         return TalkView("list", "", inner_hits)
+    dialogue_hits = matched_keywords(normalized, DIALOGUE_KEYWORDS)
+    if dialogue_hits:
+        return TalkView("dialogue", "", dialogue_hits)
     list_hits = matched_keywords(normalized, LIST_PAGE_KEYWORDS)
     if len(list_hits) >= LIST_PAGE_MIN_HITS:
         return TalkView("list", "", list_hits)
@@ -309,6 +327,85 @@ def available_task_point(
     return point, evidence
 
 
+def unavailable_contact(text: object) -> bool:
+    return bool(matched_keywords(text, ("未拥有", "未持有", "持有该服装时")))
+
+
+def conversation_tab_point(frame, boxes) -> tuple[tuple[float, float] | None, str]:
+    """Enter the chat tab when a cyan unread badge is visible beside contacts."""
+    text = _norm(" ".join(str(getattr(box, "name", "")) for box in boxes))
+    if "glutalk" not in text or "缘分列表" not in text:
+        return None, "不是角色缘分列表"
+    if frame is None or frame.ndim != 3 or frame.shape[2] < 3:
+        return None, "没有可识别的聊天标签画面"
+    height, width = frame.shape[:2]
+    left, top, crop = relative_roi_frame(frame, CONVERSATION_TAB_BADGE_ROI)
+    if not crop.size:
+        return None, "聊天标签区域为空"
+    blue, green, red = (crop[..., index] for index in range(3))
+    mask = ((blue >= 140) & (green >= 100) & (red <= 100)).astype("uint8")
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    candidates = []
+    for x, y, w, h, area in stats[1:count]:
+        if not (.012 * height <= w <= .04 * height and .012 * height <= h <= .04 * height):
+            continue
+        if not (.65 <= w / h <= 1.45) or area < .4 * w * h:
+            continue
+        # The badge itself does not forward clicks to the tab. Its associated
+        # speech-bubble button sits immediately below and to its left.
+        candidates.append((
+            (left + x + w / 2 - .8 * w) / width,
+            (top + y + h / 2 + .55 * h) / height,
+        ))
+    if len(candidates) != 1:
+        return None, "未识别到唯一的未读聊天标签角标"
+    return candidates[0], "角色列表左侧有未读聊天角标，切换到会话列表"
+
+
+def new_fate_character_point(
+    boxes, width: int, height: int, *, excluded=(),
+) -> tuple[tuple[float, float] | None, str]:
+    """Choose an observed character name below the positive 新的缘分 header.
+
+    Stop at the following section header, so completed/MAX characters in the
+    ordinary fate section cannot be selected as new encounters.
+    """
+    rows = []
+    for box in boxes:
+        point = _point(box, width, height)
+        name = _norm(getattr(box, "name", ""))
+        if point is not None and _inside(point, AVAILABLE_TASK_RELATIVE_ROI) and name:
+            rows.append((point, name))
+    headers = sorted(
+        (point for point, name in rows if _NEW_FATE_RE.fullmatch(name)),
+        key=lambda point: point[1],
+    )
+    if not headers:
+        return None, "未发现有角色的新的缘分分组"
+    top = headers[0][1]
+    bottom = min(
+        (point[1] for point, name in rows
+         if point[1] > top and _FATE_HEADER_RE.fullmatch(name)),
+        default=AVAILABLE_TASK_RELATIVE_ROI[3],
+    )
+    candidates = []
+    for point, name in rows:
+        if not (top + .015 < point[1] < bottom - .01):
+            continue
+        if len(name) < 2 or name in excluded or _FATE_HEADER_RE.fullmatch(name):
+            continue
+        if any(word in name for word in ("max", "已完成", "未解锁", "开始对话", "剩余相遇")):
+            continue
+        if any("max" in other and abs(other_point[1] - point[1]) < .02
+               for other_point, other in rows):
+            continue
+        candidates.append((point[1], point[0], point, name))
+    if not candidates:
+        return None, "新的缘分分组没有尚未尝试的角色"
+    _, _, point, name = min(candidates)
+    return point, name
+
+
 def unread_badge_point(
     boxes,
     width: int,
@@ -345,17 +442,53 @@ def unread_badge_point(
     return point, f"未读消息{unread}：会话角标 {value}"
 
 
+def encounter_button_point(
+    boxes, width: int, height: int,
+) -> tuple[tuple[float, float] | None, str]:
+    """Locate the current encounter card's start button, never its replay link."""
+    labels = [(box, _norm(getattr(box, "name", ""))) for box in boxes]
+    cards = []
+    buttons = []
+    for box, name in labels:
+        point = _point(box, width, height)
+        if point is None or not _inside(point, (.52, .30, .80, .84)):
+            continue
+        prefix = name.removesuffix("进行相遇事件")
+        if name.endswith("进行相遇事件") and (not prefix or prefix.isdigit()):
+            buttons.append(point)
+        elif "相遇事件" in name or re.fullmatch(r"第\d+次相遇", name):
+            if "回放" not in name:
+                cards.append(point)
+    if len(buttons) != 1:
+        return None, "未识别到唯一的进行相遇事件按钮"
+    point = buttons[0]
+    if not any(card[1] < point[1] and abs(card[0] - point[0]) < .16 for card in cards):
+        return None, "相遇按钮缺少同列相遇卡片证据"
+    return point, "当前会话的相遇卡片：进行相遇事件"
+
+
 def reply_button_point(
     boxes,
     width: int,
     height: int,
     roi=REPLY_RELATIVE_ROI,
+    *,
+    require_send_control: bool = False,
 ) -> tuple[tuple[float, float] | None, str]:
     """Click target for the lower-right reply button of the selected chat."""
+    if require_send_control and not any(
+        _norm(getattr(box, "name", "")) == "发送消息"
+        and (point := _point(box, width, height)) is not None
+        and _inside(point, (.50, .65, .80, .82))
+        for box in boxes
+    ):
+        return None, "尚未出现发送消息控件，等待聊天消息显示完成"
     candidates = []
     for box in boxes:
         name = _norm(getattr(box, "name", ""))
-        if len(name) < 2:
+        if len(name) < 2 and not (
+            require_send_control and len(name) == 1 and "\u4e00" <= name <= "\u9fff"
+        ):
             continue
         # "ep2对话结束" is a chapter separator, never a reply button.
         if _CHAPTER_MARKER_RE.match(name):
@@ -372,6 +505,30 @@ def reply_button_point(
     return point, f"回复按钮：{name}"
 
 
+def encounter_confirmation_point(
+    boxes, width: int, height: int,
+) -> tuple[tuple[float, float] | None, str]:
+    """Confirm only the observed free encounter dialog with a positive quota."""
+    prompt = False
+    quota = None
+    confirms = []
+    for box in boxes:
+        name = _norm(getattr(box, "name", ""))
+        point = _point(box, width, height)
+        if point is None:
+            continue
+        if name == "是否要进行相遇事件" and _inside(point, (.35, .40, .65, .55)):
+            prompt = True
+        match = re.fullmatch(r"可进行次数(\d+)次", name)
+        if match and _inside(point, (.35, .45, .65, .60)):
+            quota = int(match.group(1))
+        if name in ("确认", "确定") and _inside(point, (.50, .58, .64, .68)):
+            confirms.append(point)
+    if not prompt or quota is None or not 1 <= quota <= 3 or len(confirms) != 1:
+        return None, "相遇确认窗缺少明确提示、免费次数或唯一确认按钮"
+    return confirms[0], f"确认相遇事件，可进行次数{quota}次"
+
+
 def dialogue_decision(
     text: object,
     boxes,
@@ -385,6 +542,33 @@ def dialogue_decision(
     normalized = _norm(text)
     if not normalized:
         return None
+    if "获得好感度奖励" in normalized and re.search(r"获得.+的好感度奖励", normalized):
+        for box in boxes:
+            point = _point(box, width, height)
+            if (
+                _norm(getattr(box, "name", "")) == "获得好感度奖励"
+                and point is not None and _inside(point, (.35, .25, .65, .45))
+            ):
+                return TalkAction("dismiss_reward", point, "相遇好感度奖励已显示，点击关闭奖励画面")
+        return None
+    if "是否要进行相遇事件" in normalized:
+        point, evidence = encounter_confirmation_point(boxes, width, height)
+        return TalkAction("encounter_confirm", point, evidence) if point is not None else None
+    if "跳过对话" in normalized and (
+        "可通过格鲁talk" in normalized or "取消" in normalized
+    ):
+        # This is a modal title, not the top-right story skip control.
+        if not allow_skip or "可通过格鲁talk简介相遇事件" not in normalized:
+            return None
+        confirms = [
+            point for box in boxes
+            if _norm(getattr(box, "name", "")) in ("确认", "确定")
+            and (point := _point(box, width, height)) is not None
+            and _inside(point, (.50, .60, .65, .80))
+        ]
+        if len(confirms) == 1:
+            return TalkAction("skip_confirm", confirms[0], "确认跳过当前相遇剧情")
+        return None
 
     for box in boxes:
         name = _norm(getattr(box, "name", ""))
@@ -393,7 +577,10 @@ def dialogue_decision(
         point = _point(box, width, height)
         if point is None:
             continue
-        if allow_skip and ("跳过" in name or name == "skip"):
+        if (
+            allow_skip and name in ("跳过", "跳过对话", "skip")
+            and _inside(point, (.65, .0, 1.0, .20))
+        ):
             return TalkAction("skip", point, name)
         if any(_norm(word) == name for word in DISMISS_KEYWORDS):
             return TalkAction("dismiss", point, name)

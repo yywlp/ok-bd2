@@ -26,12 +26,16 @@ from src.tasks.glutalk_vision import (
     available_task_point,
     classify_talk_page,
     close_button_point,
+    conversation_tab_point,
     dialogue_decision,
     dialogue_ended,
+    encounter_button_point,
     episode_number,
     home_talk_entry,
+    new_fate_character_point,
     remaining_encounters,
     reply_button_point,
+    unavailable_contact,
     unread_badge_point,
     unread_count,
 )
@@ -46,6 +50,10 @@ SKIP_TEMPLATE = TemplateSpec(
 TALK_TEMPLATE = TemplateSpec(
     "格鲁TALK快进", "image/UI_talk.png", 0.72,
     relative_roi=(0.45, 0.68, 1.0, 1.0),
+)
+UNLOCK_BACK_TEMPLATE = TemplateSpec(
+    "格鲁TALK特效解锁返回", "back_return_bar_arrow.png", .78,
+    relative_roi=(0.0, 0.0, .15, .12),
 )
 
 
@@ -79,10 +87,11 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
             "每段对话最长秒数": 90.0,
             "回复点击间隔秒数": 0.8,
             "最多对话次数": 3,
-            "最多推进点击次数": 40,
-            "每段最多点击次数": 12,
+            "最多推进点击次数": 80,
+            "每段最多点击次数": 24,
             "每段结束后回主页重进": True,
             "重进后等待秒数": 2.0,
+            "重进后检查秒数": 4.0,
             "无动作判定轮数": 6,
             "可对话关键词": "、".join(AVAILABLE_TASK_DEFAULT_KEYWORDS),
             "使用跳过按钮": True,
@@ -105,6 +114,7 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
                 "才会触发下一阶段对话（游戏机制）。关闭后只处理当前一段。"
             ),
             "重进后等待秒数": "重新打开格鲁TALK 后等待界面刷新的时间。",
+            "重进后检查秒数": "重新打开后持续检查新消息或相遇入口的时间，避免过早结束。",
             "无动作判定轮数": "连续多少帧找不到可点击元素就判定没有更多对话。",
             "可对话关键词": (
                 "逗号/顿号分隔。只有条目文字命中其中之一且未命中「已完成」等否定词才会点击。"
@@ -252,37 +262,57 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
         return True
 
     def _advance_stage(self, stage: int) -> str:
-        """Advance one EP. Returns ``ended`` / ``idle`` / ``limit`` / ``failed``.
+        """Advance one EP.
+
+        Returns ``ended`` / ``home`` / ``idle`` / ``limit`` / ``failed``.
 
         The chapter separator "EPn. 对话结束" has the highest priority: once it
         appears we stop clicking immediately, because the game only unlocks the
         next episode after leaving GLU TALK and re-opening it from the home screen.
+
+        2026-11-17 实机：点完最后一条回复后，游戏有时不显示任何结束提示，
+        直接把格鲁TALK 窗口关掉退回主页；这种帧返回 ``home``，由上层重开窗口，
+        不再当成「页面判定持续未知」停机。
         """
         self.info_set("对话阶段", stage)
         self.info_set("当前阶段", f"第 {stage} 段对话推进中")
         if not hasattr(self, "_click_total"):
             self._click_total = 0
         timeout = max(10.0, float(self.config.get("每段对话最长秒数", 90.0)))
-        stage_clicks_limit = max(1, min(60, int(self.config.get("每段最多点击次数", 12))))
-        total_clicks_limit = max(1, min(200, int(self.config.get("最多推进点击次数", 40))))
+        stage_clicks_limit = max(1, min(60, int(self.config.get("每段最多点击次数", 24))))
+        total_clicks_limit = max(1, min(200, int(self.config.get("最多推进点击次数", 80))))
         idle_limit = max(1, int(self.config.get("无动作判定轮数", 6)))
         interval = max(0.2, float(self.config.get("回复点击间隔秒数", 0.8)))
         end_at = monotonic() + timeout
         clicks = 0
         idle = 0
+        home_frames = 0
+        character_attempts: dict[str, int] = {}
+        tab_attempts = 0
+        encounter_attempts = 0
+        encounter_confirm_attempts = 0
+        unlock_attempts = 0
+        conversation_attempts: dict[tuple[float, float], int] = {}
 
-        while (
-            monotonic() < end_at
-            and clicks < stage_clicks_limit
-            and self._click_total < total_clicks_limit
-        ):
+        while monotonic() < end_at:
             frame, boxes, text = self._read()
             height, width = frame.shape[:2]
-            if dialogue_ended(text):
+            current_reply, _ = reply_button_point(
+                boxes, width, height, require_send_control=True,
+            )
+            encounter, encounter_evidence = encounter_button_point(boxes, width, height)
+            view = classify_talk_page(text)
+            if (
+                dialogue_ended(text)
+                and view.page != "popup"
+                and current_reply is None
+                and encounter is None
+                and not (unread_count(text) or 0)
+            ):
                 episode = episode_number(text)
                 previous = getattr(self, "_last_episode", None)
                 if (
-                    stage > 1 and episode is not None
+                    stage > 1 and clicks == 0 and episode is not None
                     and previous is not None and episode <= previous
                 ):
                     self.info_set("状态", "重进后仍是上一段对话记录，没有新阶段。")
@@ -290,18 +320,49 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
                 self._last_episode = episode
                 self.info_set("状态", f"第 {stage} 段对话结束，停止点击。")
                 return "ended"
-            view = classify_talk_page(text)
+            if clicks >= stage_clicks_limit or self._click_total >= total_clicks_limit:
+                break
             self.info_set("页面判断", view.page)
             self._diagnose(view.diagnostics)
             remaining, unread = self._report_counters(text)
             action: TalkAction | None = None
 
+            if view.page == "unlock":
+                if unlock_attempts >= 2 or not self._click_template(frame, UNLOCK_BACK_TEMPLATE):
+                    self.info_set("状态", "未能退出好感度特效解锁页，停止重复点击。")
+                    return "failed"
+                unlock_attempts += 1
+                clicks += 1
+                self._click_total += 1
+                idle = 0
+                self.info_set("推进点击数", self._click_total)
+                self.sleep(interval)
+                continue
+
+            # Full-screen encounters use an icon-only skip control. OCR can
+            # read only its F2 hint; require the existing template to advance.
+            if (
+                view.page == "unknown"
+                and bool(self.config.get("使用跳过按钮", True))
+                and self._click_template(frame, SKIP_TEMPLATE)
+            ):
+                clicks += 1
+                self._click_total += 1
+                idle = 0
+                self.info_set("推进点击数", self._click_total)
+                self.sleep(interval)
+                continue
+
             if view.page == "popup":
                 action = dialogue_decision(
                     text, boxes, width, height,
-                    allow_skip=False,
+                    allow_skip=bool(self.config.get("使用跳过按钮", True)),
                     allow_choice=bool(self.config.get("点击对话选项", False)),
                 )
+                if action is not None and action.kind == "encounter_confirm":
+                    if encounter_confirm_attempts >= 2:
+                        self.info_set("状态", "相遇确认后未进入剧情，停止重复确认。")
+                        return "failed"
             elif view.page == "dialogue":
                 if bool(self.config.get("使用跳过按钮", True)):
                     if self._click_template(frame, SKIP_TEMPLATE) or self._click_template(
@@ -319,18 +380,50 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
                     allow_choice=bool(self.config.get("点击对话选项", False)),
                 )
             elif view.page == "list":
-                if bool(self.config.get("自动发送回复", True)):
-                    reply, evidence = reply_button_point(boxes, width, height)
+                if encounter is not None:
+                    self.info_set("可对话证据", encounter_evidence)
+                    if remaining is None or remaining <= 0:
+                        self.info_set("状态", "相遇入口已出现，但未确认有剩余相遇次数，停止点击。")
+                        return "failed"
+                    if encounter_attempts >= 2:
+                        self.info_set(
+                            "状态", "相遇入口点击后未进入，请检查相遇条件；停止重复选择角色。",
+                        )
+                        return "failed"
+                    action = TalkAction("encounter", encounter, encounter_evidence)
+                if action is None:
+                    tab, evidence = conversation_tab_point(frame, boxes)
+                    if tab is not None and tab_attempts < 2:
+                        action = TalkAction("conversation_tab", tab, evidence)
+                blocked_contact = unavailable_contact(text)
+                if blocked_contact:
+                    character_attempts = {name: 2 for name in character_attempts}
+                if action is None and not blocked_contact and bool(
+                    self.config.get("自动发送回复", True)
+                ):
+                    reply, evidence = reply_button_point(
+                        boxes, width, height, require_send_control=True,
+                    )
                     self.info_set("回复证据", evidence)
                     if reply is not None:
                         action = TalkAction("reply", reply, evidence)
+                if action is None and remaining is not None and remaining > 0:
+                    target, character = new_fate_character_point(
+                        boxes, width, height,
+                        excluded={name for name, count in character_attempts.items() if count >= 2},
+                    )
+                    self.info_set("可对话证据", character)
+                    if target is not None:
+                        action = TalkAction("character", target, character)
                 if action is None:
                     badge, badge_evidence = unread_badge_point(
                         boxes, width, height, unread=unread,
                     )
                     self.info_set("可对话证据", badge_evidence)
                     if badge is not None:
-                        action = TalkAction("conversation", badge, badge_evidence)
+                        key = tuple(round(value, 2) for value in badge)
+                        if conversation_attempts.get(key, 0) < 2:
+                            action = TalkAction("conversation", badge, badge_evidence)
                     else:
                         target, evidence = available_task_point(
                             boxes, width, height, self._keywords(),
@@ -339,6 +432,19 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
                             self.info_set("可对话证据", evidence)
                             action = TalkAction("conversation", target, evidence)
             else:
+                # 既不是列表页也不是对话页：可能游戏已把窗口关掉退回主页。
+                # 主页三信号（左列关键词 / 亮度 / 抽抽乐文字）连续两帧确认后
+                # 按「本段对话结束」处理，避免把主页当成未知页停机。
+                if self._frame_confirms_home(frame, "格鲁TALK未知页"):
+                    home_frames += 1
+                    if home_frames >= 2:
+                        self.info_set(
+                            "状态", f"第 {stage} 段对话结束：界面已退回主页。",
+                        )
+                        return "home"
+                    self.sleep(0.5)
+                    continue
+                home_frames = 0
                 idle += 1
                 if idle >= idle_limit:
                     self._fail("页面判定持续未知")
@@ -347,11 +453,33 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
                 continue
 
             if action is None:
-                if remaining == 0 and (unread == 0 or unread is None):
+                if (
+                    remaining == 0 and (unread == 0 or unread is None)
+                    and not character_attempts and not conversation_attempts
+                    and not encounter_attempts and not encounter_confirm_attempts
+                ):
                     self.info_set("状态", "今日剩余相遇 0，且没有未读对话。")
                     return "idle"
                 idle += 1
                 if idle >= idle_limit:
+                    if (
+                        character_attempts or conversation_attempts
+                        or encounter_attempts or encounter_confirm_attempts
+                    ):
+                        # 2026-11-17 实机：最后一条回复点完后，游戏不再显示
+                        # 「EPn.对话结束」标记，聊天窗口留在原地、右下角「发送
+                        # 消息」控件消失，而顶部「未读消息」计数还没更新。旧逻辑
+                        # 在这里直接判失败，整轮白跑。本轮已经点过回复按钮且现在
+                        # 读不到回复按钮，就按「本段结束」收尾：上层会关窗回主页
+                        # 再重开，由 _has_new_stage 判断是否还有下一段。
+                        if clicks > 0 and current_reply is None:
+                            self.info_set(
+                                "状态",
+                                f"第 {stage} 段对话已无回复按钮，按本段结束处理。",
+                            )
+                            return "ended"
+                        self.info_set("状态", "已尝试选择角色，但未确认本段对话完成。")
+                        return "failed"
                     self.info_set("状态", "没有可对话的任务。")
                     return "idle"
                 self.sleep(0.6)
@@ -360,6 +488,17 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
             self.operate_click(
                 *action.point, name=f"格鲁TALK{action.kind}", after_sleep=0.3,
             )
+            if action.kind == "character":
+                character_attempts[action.evidence] = character_attempts.get(action.evidence, 0) + 1
+            elif action.kind == "conversation_tab":
+                tab_attempts += 1
+            elif action.kind == "encounter":
+                encounter_attempts += 1
+            elif action.kind == "encounter_confirm":
+                encounter_confirm_attempts += 1
+            elif action.kind == "conversation":
+                key = tuple(round(value, 2) for value in action.point)
+                conversation_attempts[key] = conversation_attempts.get(key, 0) + 1
             clicks += 1
             self._click_total += 1
             idle = 0
@@ -367,30 +506,44 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
             self.sleep(interval)
 
         if clicks >= stage_clicks_limit:
-            self.log_warning("格鲁TALK：本段对话达到点击上限，安全停止。")
+            reason = "本段对话达到点击上限，尚未确认结束"
+        elif self._click_total >= total_clicks_limit:
+            reason = "达到总点击上限，尚未完成全部对话"
+        else:
+            reason = "本段对话等待超时，尚未确认结束"
+        self.info_set("状态", f"格鲁TALK 未完成：{reason}。")
+        self.log_warning(f"格鲁TALK：{reason}，停止本次运行。")
         return "limit"
 
-    def _restart_from_home(self) -> bool:
-        """Close GLU TALK, confirm the home screen, then open GLU TALK again."""
-        self.info_set("当前阶段", "对话结束：返回主界面并重新打开格鲁TALK")
-        frame, boxes, _ = self._read()
-        height, width = frame.shape[:2]
-        close = close_button_point(boxes, width, height)
-        if close is not None:
-            self.operate_click(*close, name="格鲁TALK关闭", after_sleep=0.6)
+    def _restart_from_home(self, already_home: bool = False) -> bool:
+        """Confirm the home screen, then open GLU TALK again.
+
+        ``already_home`` skips the closing steps: the game itself closed the
+        window and dropped us on the home page (2026-11-17 实测)，此时再按关闭
+        按钮或返回键只会在主页上乱点。
+        """
+        if already_home:
+            self.info_set("当前阶段", "已回到主界面：重新打开格鲁TALK")
         else:
-            self.try_return_home_with_back(max_presses=1)
-        # Wait until the GLU TALK window is really gone before going home.
-        end_at = monotonic() + 5.0
-        while monotonic() < end_at:
-            _, _, text = self._read()
-            if classify_talk_page(text).page != "list":
-                break
-            self.sleep(0.4)
-        else:
-            self.try_return_home_with_back(max_presses=2)
-        if not self._safe_return_home():
-            return False
+            self.info_set("当前阶段", "对话结束：返回主界面并重新打开格鲁TALK")
+            frame, boxes, _ = self._read()
+            height, width = frame.shape[:2]
+            close = close_button_point(boxes, width, height)
+            if close is not None:
+                self.operate_click(*close, name="格鲁TALK关闭", after_sleep=0.6)
+            else:
+                self.try_return_home_with_back(max_presses=1)
+            # Wait until the GLU TALK window is really gone before going home.
+            end_at = monotonic() + 5.0
+            while monotonic() < end_at:
+                _, _, text = self._read()
+                if classify_talk_page(text).page != "list":
+                    break
+                self.sleep(0.4)
+            else:
+                self.try_return_home_with_back(max_presses=2)
+            if not self._safe_return_home():
+                return False
         if not self._wait_for_home_confirmation("重进格鲁TALK前主页确认"):
             return False
         frame, boxes, _ = self._read()
@@ -406,52 +559,81 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
     def _has_new_stage(
         self, text, boxes, width: int, height: int, previous_episode: int | None,
     ) -> bool:
-        """Only a NEW episode/unread/reply counts as a next stage."""
-        episode = episode_number(text)
-        if dialogue_ended(text) and (
-            episode is None or previous_episode is None or episode <= previous_episode
-        ):
-            # The old "EP2.对话结束" line stays in the chat history after re-entry.
-            return False
-        reply, _ = reply_button_point(boxes, width, height)
-        if reply is not None:
+        """Look for an actionable chat or encounter, not just unused quota."""
+        encounter, _ = encounter_button_point(boxes, width, height)
+        if encounter is not None and (remaining_encounters(text) or 0) > 0:
             return True
-        if (unread_count(text) or 0) > 0:
+        reply, _ = reply_button_point(boxes, width, height, require_send_control=True)
+        if reply is not None or (unread_count(text) or 0) > 0:
             return True
         if (remaining_encounters(text) or 0) > 0:
-            return True
-        return bool(
-            episode is not None
-            and previous_episode is not None
-            and episode > previous_episode
+            character, _ = new_fate_character_point(boxes, width, height)
+            if character is not None:
+                return True
+        target, _ = available_task_point(boxes, width, height, self._keywords())
+        return target is not None and unread_count(text) != 0
+
+    def _wait_for_next_stage(self) -> bool:
+        """Allow newly reopened chats to populate before deciding to leave."""
+        end_at = monotonic() + max(
+            .5, float(self.config.get("重进后检查秒数", 4.0)),
         )
+        while True:
+            frame, boxes, text = self._read()
+            self._report_counters(text)
+            if self._has_new_stage(
+                text, boxes, frame.shape[1], frame.shape[0], self._last_episode,
+            ):
+                return True
+            tab, _ = conversation_tab_point(frame, boxes)
+            if tab is not None:
+                return True
+            if monotonic() >= end_at:
+                return False
+            self.sleep(.5)
 
     def _scan(self) -> bool:
         """Episode loop: one EP ends -> back to home -> reopen GLU TALK."""
+        # Migrate the original paired defaults, which were too small for the
+        # replies before AND after an encounter. Preserve other custom limits.
+        if (
+            self.config.get("每段最多点击次数") == 12
+            and self.config.get("最多推进点击次数") == 40
+        ):
+            self.config["每段最多点击次数"] = 24
+            self.config["最多推进点击次数"] = 80
         limit = max(1, min(10, int(self.config.get("最多对话次数", 3))))
         self._click_total = 0
         self._last_episode = None
         self.info_set("完成对话数", 0)
         self.info_set("推进点击数", 0)
         completed = 0
+        stage = 0
+        rechecked_idle = False
 
-        for stage in range(1, limit + 1):
+        while completed < limit:
+            stage += 1
+            before_clicks = self._click_total
             result = self._advance_stage(stage)
-            if result == "failed":
+            if result in ("failed", "limit"):
                 return False
-            if result == "ended":
-                completed += 1
-                self.info_set("完成对话数", completed)
-            if result != "ended" or stage >= limit:
-                break
+            already_home = result == "home"
+            if result in ("ended", "home"):
+                # A previous run's end marker is a cue to reopen, not a
+                # conversation completed by this run.
+                if self._click_total > before_clicks:
+                    completed += 1
+                    self.info_set("完成对话数", completed)
+                rechecked_idle = False
+            elif result == "idle":
+                if rechecked_idle:
+                    break
+                rechecked_idle = True
             if not bool(self.config.get("每段结束后回主页重进", True)):
                 break
-            if not self._restart_from_home():
+            if not self._restart_from_home(already_home=already_home):
                 return self._fail("对话结束后未能回到主界面并重进格鲁TALK")
-            frame, boxes, text = self._read()
-            if not self._has_new_stage(
-                text, boxes, frame.shape[1], frame.shape[0], self._last_episode,
-            ):
+            if not self._wait_for_next_stage():
                 self.info_set("状态", "没有下一阶段对话。")
                 break
         return True
@@ -469,9 +651,12 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
         self.info_set("页面判断", view.page)
         self._diagnose(view.diagnostics)
         self._report_counters(text)
-        if view.page == "list":
+        if view.page in ("list", "unlock"):
             # Already inside GLU TALK: do not press back or re-click the entry.
-            self.info_set("当前阶段", "已在格鲁TALK页面，直接检查")
+            self.info_set(
+                "当前阶段", "退出好感度特效解锁页" if view.page == "unlock"
+                else "已在格鲁TALK页面，直接检查",
+            )
         else:
             self.info_set("当前阶段", "主页确认")
             if not self._wait_for_home_confirmation("格鲁TALK入口前主页确认"):
@@ -491,8 +676,13 @@ class GlutalkTask(TaskVisionMixin, BaseBD2Task):
                 return self._fail("未确认进入格鲁TALK页面")
 
         if not self._scan():
+            status = (getattr(self, "info", {}) or {}).get("状态", "格鲁TALK 未完成。")
+            self._safe_return_home()
+            self.info_set("状态", status)
             return False
-        self._safe_return_home()
+        if not self._safe_return_home():
+            self.info_set("状态", "格鲁TALK 对话检查结束，但未确认返回主页。")
+            return False
         info = getattr(self, "info", {}) or {}
         completed = info.get("完成对话数", 0)
         clicks = info.get("推进点击数", 0)
